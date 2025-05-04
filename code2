@@ -1,0 +1,95 @@
+import torch
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+import snntorch as snn
+from snntorch import surrogate
+import torch.nn as nn
+
+#Rössler system
+def rossler(t, state, a=0.2, b=0.2, c=5.7):
+    x, y, z = state
+    dxdt = -y - z
+    dydt = x + a*y
+    dzdt = b + z*(x - c)
+    return [dxdt, dydt, dzdt]
+
+#Solves Rossler system
+t_span = (0, 100)
+t_eval = np.linspace(*t_span, 10000)
+sol = solve_ivp(rossler, t_span, [0.1, 0, 0], t_eval=t_eval)
+
+#Normalize the data
+data = torch.tensor(sol.y, dtype=torch.float32).T
+data = (data - data.mean(0)) / data.std(0)
+
+#Create windowed input X and target y
+#Works by having 'window size' # of input data points leading up to the target 'y'
+window_size = 10
+X = []
+y = []
+for i in range(window_size, len(data)):
+    X.append(data[i - window_size:i])  # shape: (window_size, 3)
+    y.append(data[i])                  # shape: (3,)
+X = torch.stack(X)  # (samples, time_steps, features)
+y = torch.stack(y)  # (samples, features)
+
+#Network parameters
+num_hidden = 500
+num_outputs = 3
+beta = 0.95
+spike_grad = surrogate.fast_sigmoid()
+
+#Network
+class SNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(num_outputs, num_hidden)
+        self.lif1 = snn.Leaky(beta=beta, spike_grad=spike_grad)
+        self.fc2 = nn.Linear(num_hidden, num_outputs)
+
+    def forward(self, x_seq):
+        batch_size, steps, _ = x_seq.shape
+        mem1 = torch.zeros(batch_size, num_hidden)
+        for t in range(steps):
+            cur = self.fc1(x_seq[:, t])
+            spk, mem1 = self.lif1(cur, mem1)
+        out = self.fc2(spk)
+        return out
+
+
+model = SNN()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3) #optimizer and learning rate
+loss_fn = nn.MSELoss() #loss function
+
+#Training
+epochs = 20
+
+for epoch in range(epochs):
+    optimizer.zero_grad()
+    pred = model(X)
+    loss = loss_fn(pred, y)
+    loss.backward()
+    optimizer.step()
+    print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
+  
+#Simulates with learned weights
+with torch.no_grad():
+    preds = []
+    for i in range(X.size(0)):
+        pred = model(X[i:i+1])
+        preds.append(pred.squeeze(0))
+    preds = torch.stack(preds)
+
+#Creates the plots
+def plot_result(true, pred, label):
+    plt.figure(figsize=(12, 4))
+    plt.plot(true, label=f"True {label}")
+    plt.plot(pred, '--', label=f"Predicted {label}")
+    plt.title(f"Comparison of {label} Dynamics")
+    plt.legend()
+    plt.show()
+
+plot_result(y[:, 0], preds[:, 0], "X")
+plot_result(y[:, 1], preds[:, 1], "Y")
+plot_result(y[:, 2], preds[:, 2], "Z")
