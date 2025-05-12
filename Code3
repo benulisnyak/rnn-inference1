@@ -1,0 +1,105 @@
+import torch
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+import snntorch as snn
+from snntorch import spikeplot as splt
+from snntorch import surrogate
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+#torch.manual_seed(0) 
+
+def rossler(t, state, a=0.2, b=0.2, c=5.7):
+  x, y, z = state
+  dxdt = -y - z
+  dydt = x + a*y
+  dzdt = b + z*(x - c)
+  return [dxdt, dydt, dzdt]
+
+#Solve Rössler system
+t_span = (0, 50)
+t_eval = np.linspace(*t_span, 1000)
+sol = solve_ivp(rossler, t_span, [1, 1, 1], t_eval=t_eval)
+
+#Normalize the data
+data = torch.tensor(sol.y, dtype=torch.float32).T
+data = (data - data.mean(0)) / data.std(0)
+
+#Network stuff:
+num_hidden = 200
+num_outputs = 3
+beta = 0.95 #decay parameter
+
+
+#Define Network
+class SelfEvolvingSNN(nn.Module):
+  def __init__(self):
+    super().__init__()
+    self.fc1 = nn.Linear(num_outputs, num_hidden) #.fc1 applies linear transform to the input data
+    self.lif1 = snn.RLeaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), linear_features = num_hidden, all_to_all=True) #.lif1 integrates weighted input over time
+    self.readout = nn.Linear(num_hidden, 3)
+    #nn.init.xavier_uniform_(self.lif1.weight)
+  def forward(self, steps, init_state):
+    spk1, mem1 = self.lif1.init_rleaky()
+    outputs = []
+    out = init_state.unsqueeze(0)  #adds a dimension for formatting
+    for _ in range(steps):
+      h = self.fc1(out)
+      spk1, mem1 = self.lif1(h, spk1, mem1)
+      out = self.readout(spk1)
+      outputs.append(out)
+    return torch.cat(outputs)
+
+
+######## Training
+model = SelfEvolvingSNN()
+
+#Optimizer for output layer only
+optimizer = torch.optim.Adam(model.parameters(), lr=5e-3) #applies learning to the readout layer weights
+loss_fn = nn.MSELoss()
+
+#Initial state 
+init_state = data[0]  # [X0, Y0, Z0]
+# Training loop
+epochs = 1 #Number of backpropogations loops
+time_steps = 500  #shorter for training
+num_inputs = 3
+
+
+for epoch in range(epochs):
+  optimizer.zero_grad()
+  output = model(time_steps, init_state)
+  target = data[:time_steps]
+  loss = loss_fn(output.squeeze(), target)
+  loss.backward()
+  optimizer.step()
+  print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
+
+############ End of training 
+
+with torch.no_grad(): #generates network output after training
+  generated = model(time_steps, init_state).squeeze()
+
+
+#Creates plots
+plt.figure(figsize=(12, 4))
+plt.plot(data[:time_steps, 0], label="True X")
+plt.plot(generated[:, 0], label="Generated X", linestyle='--')
+plt.legend()
+plt.title("Comparison of X Dynamics")
+plt.show()
+
+plt.figure(figsize=(12, 4))
+plt.plot(data[:time_steps, 1], label="True Y")
+plt.plot(generated[:, 1], label="Generated Y", linestyle='--')
+plt.legend()
+plt.title("Comparison of Y Dynamics")
+plt.show()
+
+plt.figure(figsize=(12, 4))
+plt.plot(data[:time_steps, 2], label="True Z")
+plt.plot(generated[:, 2], label="Generated Z", linestyle='--')
+plt.legend()
+plt.title("Comparison of Z Dynamics")
+plt.show()
