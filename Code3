@@ -7,8 +7,9 @@ from snntorch import spikeplot as splt
 from snntorch import surrogate
 import torch.nn as nn
 import matplotlib.pyplot as plt
+from snntorch import spikeplot as splt
 
-torch.manual_seed(0) 
+torch.manual_seed(0)
 
 def rossler(t, state, a=0.2, b=0.2, c=5.7):
   x, y, z = state
@@ -27,7 +28,7 @@ data = torch.tensor(sol.y, dtype=torch.float32).T
 data = (data - data.mean(0)) / data.std(0)
 
 #Network stuff:
-num_hidden = 200
+num_hidden = 500
 num_outputs = 3
 beta = 0.88 #decay parameter - larger values mean faster firing rate
 
@@ -36,61 +37,64 @@ beta = 0.88 #decay parameter - larger values mean faster firing rate
 class SelfEvolvingSNN(nn.Module):
   def __init__(self):
     super().__init__()
-    self.fc1 = nn.Linear(num_outputs, num_hidden) #.fc1 applies linear transform to the input data
-    #for param1 in self.fc1.parameters():
-      #param1.requires_grad = False
+    #self.fc1 = nn.Linear(num_outputs, num_hidden) #.fc1 applies linear transform to the input data
     self.recurrent = nn.Linear(num_hidden, num_hidden)
     self.lif1 = snn.Leaky(beta = beta, spike_grad=surrogate.fast_sigmoid())
-   
     self.readout = nn.Linear(num_hidden, 3)
-    nn.init.xavier_uniform_(self.recurrent.weight)
-  def forward(self, steps, init_state):
-    mem1 = self.lif1.init_leaky()
-    spk1 = torch.zeros_like(mem1)
-    outputs = []
-    spk_record = []
-    out = init_state.unsqueeze(0)  #adds a dimension for formatting
-    feedback = torch.zeros((1, self.fc1.out_features), device=init_state.device)
+
+  def forward(self, spikes, mem2):
+    #mem1 = self.lif1.init_leaky(batch_size=1, shape = (num_hidden)) + mem2
     bias = 0.15
-    for _ in range(steps):
-      h =  self.recurrent(feedback)*0.25 + bias + self.fc1(out)*0.25 #current supplied to the network
-      spk1, mem1 = self.lif1(h, mem1)
-      feedback = spk1 #works as connections in the network to supply other neurons with current when it spikes
-      out = self.readout(spk1)
-      outputs.append(out)
-      spk_record.append(spk1)
-    return torch.cat(outputs), torch.stack(spk_record).squeeze(1)
+    h = self.recurrent(spikes) * 0.25 + bias
+    spk1, mem2 = self.lif1(h, mem2)
+    out = self.readout(spk1)
+    return spk1, mem2, out
 
 
 ######## Training
 model = SelfEvolvingSNN()
 
 #Optimizer
-optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 loss_fn = nn.MSELoss()
 
-#Initial state 
+#Initial state
 init_state = data[0]  # [X0, Y0, Z0]
 # Training loop
-epochs = 10 #Number of backpropogations loops
-time_steps = 1000 #shorter for training
+epochs = 100 #Number of backpropogations loops
+time_steps = 2000 #shorter for training
 num_inputs = 3
 
 
 for epoch in range(epochs):
-  optimizer.zero_grad()
-  output, _ = model(time_steps, init_state)
-  target = data[:time_steps]
-  loss = loss_fn(output.squeeze(), target)
-  loss.backward()
-  optimizer.step()
-  print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
+  spikes = torch.zeros((1, num_hidden))
+  mem2 = torch.zeros_like(spikes)
+  epoch_loss = 0.0
+  for t in range(time_steps):
+    optimizer.zero_grad()
+    spikes, mem2, output = model(spikes, mem2)
+    target = data[t]
+    loss = loss_fn(output.squeeze(), target)
+    loss.backward()
+    optimizer.step()
+    spikes = spikes.detach()
+    mem2 = mem2.detach()
+    epoch_loss += loss.item()  #Add current loss
 
-############ End of training 
+  avg_loss = epoch_loss / time_steps
+  print(f"Epoch {epoch+1}, Avg Loss: {avg_loss:.6f}")
 
-with torch.no_grad(): #generates network output after training
-  generated, test_spikes = model(time_steps, init_state)
-  generated = generated.squeeze()
+with torch.no_grad():
+    spikes = torch.zeros((1, num_hidden))
+    mem2 = torch.zeros_like(spikes)
+    generated = []
+    spike_record = []
+    for _ in range(time_steps):
+        spikes, mem2, output = model(spikes, mem2)
+        generated.append(output.squeeze(0))
+        spike_record.append(spikes.squeeze(0))
+    generated = torch.stack(generated)
+    spike_record = torch.stack(spike_record)
 
 
 #Creates plots
@@ -115,8 +119,9 @@ plt.legend()
 plt.title("Comparison of Z Dynamics")
 plt.show()
 
-fig, ax = plt.subplots(figsize=(12, 6))
-splt.raster(test_spikes, ax, s=2, c="black")
+
+fig, ax = plt.subplots(figsize=(20, 10))
+splt.raster(spike_record, ax, s=2, c="black")  # Spike matrix: [time, neurons]
 plt.title("Raster Plot of Spikes")
 plt.xlabel("Time step")
 plt.ylabel("Neuron index")
